@@ -12,10 +12,11 @@ from collections import defaultdict, deque
 
 import anthropic
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -31,6 +32,7 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "").strip()
 MANAGER = "@oxygen_manager"
 PHONE = "+998 91 710 14 14"
+GYM_LAT, GYM_LON = 39.643487, 66.947908
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s", level=logging.INFO
@@ -60,7 +62,7 @@ SYSTEM_PROMPT = """Ты — Сардор (Sardor), администратор к
 - Направления: WOD, сила, выносливость, гимнастика. Оборудование: эйрбайки, дорожки, лыжные тренажёры, сани, спринт-трек.
 - С собой: спортивная форма, кроссовки, вода.
 - Телефон зала: {phone} — давай его, когда спрашивают номер или хотят позвонить.
-- Локация (давай ссылку, когда спрашивают адрес/где находимся): https://maps.google.com/?q=39.643487,66.947908 — г. Самарканд.
+- Адрес: г. Самарканд. Когда клиент спрашивает адрес/локацию/где находимся/как доехать — коротко ответь (мы в Самарканде, сейчас отправлю точку на карте) и добавь В КОНЦЕ ответа отдельной строкой служебную метку [LOCATION] — система сама отправит клиенту живую точку на карте. Ссылки на карты НЕ вставляй.
 - Instagram: @oxygen.crossfit. Менеджер в Telegram: {manager}.
 
 ТЕРМИНЫ НА УЗБЕКСКОМ: тренер = murabbiy, абонемент = obuna, тренировка = mashg'ulot, через день = kunora, бесплатно = bepul, записаться = yozilish.
@@ -85,16 +87,32 @@ SYSTEM_PROMPT = """Ты — Сардор (Sardor), администратор к
 
 # Память диалогов: chat_id -> последние 24 сообщения
 histories: dict[int, deque] = defaultdict(lambda: deque(maxlen=24))
+# Выбранный язык клиента: chat_id -> 'uz' | 'ru'
+lang_pref: dict[int, str] = {}
 
-GREETING = (
+LANG_QUESTION = "Tilni tanlang / Выберите язык 👇"
+LANG_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data="lang_uz"),
+            InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
+        ]
+    ]
+)
+
+GREETING_UZ = (
     "Salom! Men Sardor, Oxygen Fitness administratoriman 👋\n"
-    "Mashg'ulotlar, narxlar yoki bepul birinchi mashg'ulotga yozilish bo'yicha yordam beraman. "
-    "Qaysi savolingiz bor?\n\n"
-    "Привет! Я Сардор, администратор Oxygen Fitness. "
-    "Помогу с ценами, расписанием и запишу на бесплатную первую тренировку. Пишите на русском или узбекском!"
+    "Narxlar, jadval bo'yicha yordam beraman va bepul birinchi mashg'ulotga yozib qo'yaman. "
+    "Xo'sh, nimadan boshlaymiz?"
+)
+GREETING_RU = (
+    "Привет! Я Сардор, администратор Oxygen Fitness 👋\n"
+    "Помогу с ценами и расписанием, запишу на бесплатную первую тренировку. "
+    "С чего начнём?"
 )
 
 BOOKING_RE = re.compile(r"^\s*\[BOOKING\][^\n]*$", re.MULTILINE)
+LOCATION_RE = re.compile(r"^\s*\[LOCATION\]\s*$", re.MULTILINE)
 
 
 def sanitize(text: str) -> str:
@@ -106,8 +124,23 @@ def sanitize(text: str) -> str:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    histories.pop(update.effective_chat.id, None)
-    await update.message.reply_text(GREETING)
+    chat_id = update.effective_chat.id
+    histories.pop(chat_id, None)
+    lang_pref.pop(chat_id, None)
+    await update.message.reply_text(LANG_QUESTION, reply_markup=LANG_KEYBOARD)
+
+
+async def on_lang_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat_id = query.message.chat.id
+    lang = "uz" if query.data == "lang_uz" else "ru"
+    lang_pref[chat_id] = lang
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.reply_text(GREETING_UZ if lang == "uz" else GREETING_RU)
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -135,11 +168,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     history = histories[chat_id]
     history.append({"role": "user", "content": user_text})
 
+    system = SYSTEM_PROMPT
+    pref = lang_pref.get(chat_id)
+    if pref == "uz":
+        system += "\nКлиент выбрал узбекский язык. Отвечай ТОЛЬКО на узбекском (латиница), пока клиент сам явно не перейдёт на русский."
+    elif pref == "ru":
+        system += "\nКлиент выбрал русский язык. Отвечай ТОЛЬКО на русском, пока клиент сам явно не перейдёт на узбекский."
+
     try:
         response = client.messages.create(
             model=MODEL,
             max_tokens=700,
-            system=SYSTEM_PROMPT,
+            system=system,
             messages=list(history),
         )
         raw = response.content[0].text.strip()
@@ -151,13 +191,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    # Заявка на запись: вынимаем служебную строку и шлём владельцу
+    # Служебные метки: заявка на запись и локация
     bookings = BOOKING_RE.findall(raw)
-    answer = sanitize(BOOKING_RE.sub("", raw))
+    send_loc = bool(LOCATION_RE.search(raw))
+    answer = sanitize(LOCATION_RE.sub("", BOOKING_RE.sub("", raw)))
     history.append({"role": "assistant", "content": raw})
 
     if answer:
         await update.message.reply_text(answer)
+
+    if send_loc:
+        try:
+            await context.bot.send_venue(
+                chat_id=chat_id,
+                latitude=GYM_LAT,
+                longitude=GYM_LON,
+                title="Oxygen Fitness",
+                address="Samarqand · 08:00–21:00",
+            )
+        except Exception:
+            log.exception("Failed to send venue")
 
     if bookings and ADMIN_CHAT_ID:
         user = update.effective_user
@@ -182,6 +235,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CallbackQueryHandler(on_lang_choice, pattern="^lang_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     log.info("Oxygen Fitness agent 'Sardor' started (long polling)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
